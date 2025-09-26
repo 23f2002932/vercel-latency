@@ -1,74 +1,68 @@
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
-from typing import List
-
 from pydantic import BaseModel
+from typing import List
+import pandas as pd
+import os
 
+# --- 1. Imports are at the top ---
+# It's a best practice to have all imports at the top of the file.
 
-app = FastAPI(debug=True)
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],    # Allows all origins
-    allow_methods=["*"],
-    allow_headers=["*"],
-    expose_headers=["*"]    # Expose all the headers to the browser in response
-)
-
-
+# --- 2. Pydantic model for request validation ---
 class CheckRequest(BaseModel):
     regions: List[str]
     threshold_ms: int
 
+# --- 3. Create the FastAPI App and Enable CORS ---
+app = FastAPI()
 
-# REQUEST:->         {"regions":["amer","emea"],"threshold_ms":152}
-# RESPONSE:->        {"regions":{"amer":{"avg_latency":176.27,"p95":220.86,"avg_uptime":97.98,"breaches":9},"emea":{"avg_latency":177.2,"p95":218.3,"avg_uptime":98.5,"breaches":8}}}
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
-@app.post("/check")
-def check(data: CheckRequest):
-    regions = data.regions
-    threshold_ms = data.threshold_ms
+# --- 4. Load data ONCE when the app starts, not on every request ---
+# This is much more efficient.
+try:
+    base_dir = os.path.dirname(__file__)
+    file_path = os.path.join(base_dir, "q-vercel-latency.json")
+    telemetry_df = pd.read_json(file_path)
+except Exception as e:
+    print(f"Error loading data file: {e}")
+    telemetry_df = pd.DataFrame()
 
-    import json
-    import os
+# --- 5. The API Endpoint ---
+@app.post("/")
+async def get_latency_stats(data: CheckRequest):
+    if telemetry_df.empty:
+        return {"error": "Server is missing the telemetry data file."}, 500
 
-    file = "q-vercel-latency.json"
-    path = os.path.join(os.path.dirname(__file__), file)
-    with open(path, "r") as f:
-        telemetry = json.load(f)
+    results_list = []
 
-    result = {}
+    # Process each region from the validated request data
+    for region in data.regions:
+        region_df = telemetry_df[telemetry_df['region'] == region]
 
-    for region in regions:
-        latency_sum = 0
-        uptime_sum = 0
-        breaches = 0
-        count = 0
+        if not region_df.empty:
+            # Using pandas is much cleaner and more efficient than manual loops
+            avg_latency = round(region_df['latency_ms'].mean(), 2)
+            p95_latency = round(region_df['latency_ms'].quantile(0.95), 2)
+            avg_uptime = round(region_df['uptime_pct'].mean(), 3)
+            breaches = int((region_df['latency_ms'] > data.threshold_ms).sum())
 
-        for entry in telemetry:
-            if entry["region"] == region:
-                latency_sum += entry["latency_ms"]
-                uptime_sum += entry["uptime_pct"]
-                count += 1
-                if entry["latency_ms"] > threshold_ms:
-                    breaches += 1
+            # --- 6. The response format must be a LIST of objects ---
+            results_list.append({
+                "region": region,
+                "avg_latency": avg_latency,
+                "p95_latency": p95_latency,
+                "avg_uptime": avg_uptime,
+                "breaches": breaches,
+            })
 
-        avg_latency = round(latency_sum / count, 2) if count else 0
-        avg_uptime = round(uptime_sum / count, 2) if count else 0
-        import numpy as np
+    return {"regions": results_list}
 
-        region_latencies = [e["latency_ms"] for e in telemetry if e["region"] == region]
-        p95 = np.percentile(region_latencies, 95) if region_latencies else 0
-
-        result[region] = {
-            "avg_latency": round(avg_latency, 2),
-            "p95": round(p95, 2),
-            "avg_uptime": round(avg_uptime, 2),
-            "breaches": breaches,
-        }
-    return {"regions": result}
-
-
-if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+@app.get("/")
+async def root():
+    return {"message": "API is running. Use a POST request to get statistics."}
